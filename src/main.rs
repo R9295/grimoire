@@ -153,6 +153,7 @@ fn main() {
 )]
 struct Opt {
     executable: PathBuf,
+    #[arg(short = 'o')]
     out_dir: PathBuf,
     #[arg(short = 'c', value_parser=Cores::from_cmdline)]
     cores: Cores,
