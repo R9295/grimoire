@@ -1,33 +1,38 @@
 use std::{io::ErrorKind, path::PathBuf, process::Command, time::Duration};
 
-use clap::{Parser};
+use clap::Parser;
 use libafl::{
     corpus::{CachedOnDiskCorpus, OnDiskCorpus},
     events::{ClientDescription, EventConfig, Launcher},
     executors::ForkserverExecutor,
-    feedback_or, feedback_or_fast,
+    feedback_or,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     inputs::{BytesInput, GeneralizedInputMetadata},
     monitors::MultiMonitor,
     mutators::{
-        havoc_mutations, tokens_mutations, GrimoireExtensionMutator, GrimoireRandomDeleteMutator,
-        GrimoireRecursiveReplacementMutator, GrimoireStringReplacementMutator,
-        HavocScheduledMutator, Tokens,
+        havoc_mutations, tokens_mutations, AFLppRedQueen, GrimoireExtensionMutator,
+        GrimoireRandomDeleteMutator, GrimoireRecursiveReplacementMutator,
+        GrimoireStringReplacementMutator, HavocScheduledMutator, Tokens,
     },
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{powersched::PowerSchedule, StdWeightedScheduler},
-    stages::{GeneralizationStage, StdMutationalStage},
-    state::StdState,
-    Fuzzer, HasMetadata, StdFuzzer,
+    stages::{
+        mutational::MultiMutationalStage, ColorizationStage, GeneralizationStage, IfStage,
+        StdMutationalStage, SyncFromDiskStage,
+    },
+    state::{HasCurrentTestcase, StdState},
+    Error, Fuzzer, HasMetadata, StdFuzzer,
 };
 use libafl_bolts::{
     core_affinity::Cores,
     current_nanos,
-    rands::StdRand,
+    ownedref::OwnedRefMut,
+    rands::{RomuDuoJrRand, StdRand},
     shmem::{ShMem, ShMemProvider, StdShMemProvider, UnixShMemProvider},
-    tuples::{tuple_list, Merge},
+    tuples::{tuple_list, Handled, Merge},
     AsSliceMut, TargetArgs,
 };
+use libafl_targets::{cmps::AFLppCmpLogMap, AFLppCmpLogObserver, AFLppCmplogTracingStage};
 const SHMEM_ENV_VAR: &str = "__AFL_SHM_ID";
 fn main() {
     let opt = Opt::parse();
@@ -64,6 +69,7 @@ fn main() {
         // Create the shared memory map for comms with the forkserver
         let mut shmem_provider = UnixShMemProvider::new().unwrap();
         let mut shmem = shmem_provider.new_shmem(map_size).unwrap();
+        let is_main_node = opt.cores.position(core.core_id()).expect("invariant") == 0;
         unsafe {
             shmem.write_to_env(SHMEM_ENV_VAR).unwrap();
         }
@@ -73,6 +79,7 @@ fn main() {
                 .track_indices()
                 .track_novelties()
         };
+        let colorization = ColorizationStage::new(&edges_observer);
         let map_feedback = MaxMapFeedback::new(&edges_observer);
         // Create an observation channel to keep track of the execution time.
         let time_observer = TimeObserver::new("time");
@@ -118,12 +125,62 @@ fn main() {
             ),
             3,
         );
+        // The CmpLog map shared between the CmpLog observer and CmpLog executor
+        let mut cmplog_shmem = shmem_provider.uninit_on_shmem::<AFLppCmpLogMap>().unwrap();
+
+        // Let the Forkserver know the CmpLog shared memory map ID.
+        unsafe {
+            cmplog_shmem.write_to_env(SHM_CMPLOG_ENV_VAR).unwrap();
+        }
+        let cmpmap = unsafe { OwnedRefMut::from_shmem(&mut cmplog_shmem) };
+
+        // Create the CmpLog observer.
+        let cmplog_observer = AFLppCmpLogObserver::new("cmplog", cmpmap, true);
+        let cmplog_ref = cmplog_observer.handle();
+        let mut cmplog_executor = ForkserverExecutor::builder()
+            .program(opt.executable.clone())
+            .coverage_map_size(map_size)
+            .is_persistent(true)
+            .is_deferred_frksrv(true)
+            .timeout(Duration::from_millis((opt.hang_timeout * 1000) * 2))
+            .shmem_provider(&mut shmem_provider)
+            .build(tuple_list!(cmplog_observer))
+            .unwrap();
+        // Create the CmpLog tracing stage.
+        let tracing = AFLppCmplogTracingStage::new(cmplog_executor, cmplog_ref);
+
+        // Create a randomic Input2State stage
+        let rq = MultiMutationalStage::<_, _, BytesInput, _, _, _>::new(
+            AFLppRedQueen::with_cmplog_options(true, true),
+        );
+        let cb = |_fuzzer: &mut _,
+                  _executor: &mut _,
+                  state: &mut StdState<_, _, _, _>,
+                  _event_manager: &mut _|
+         -> Result<bool, Error> {
+            let testcase = state.current_testcase()?;
+            if is_main_node && testcase.scheduled_count() == 0 {
+                return Ok(true);
+            }
+            Ok(false)
+        };
+        // Create a Sync stage to sync from foreign fuzzers
+        let sync_stage = IfStage::new(
+            |_, _, _, _| Ok(is_main_node && !opt.foreign_sync_dirs.is_empty()),
+            tuple_list!(SyncFromDiskStage::with_from_file(
+                opt.foreign_sync_dirs.clone(),
+                Duration::from_secs(15 * 60),
+            )),
+        );
+        let cmplog = IfStage::new(cb, tuple_list!(colorization, tracing, rq));
         let mut stages = tuple_list!(
+            cmplog,
             generalization,
             StdMutationalStage::new(mutator),
             StdMutationalStage::<_, _, GeneralizedInputMetadata, BytesInput, _, _, _>::transforming(
                 grimoire_mutator
-            )
+            ),
+            sync_stage,
         );
         let mut executor = ForkserverExecutor::builder()
             .program(opt.executable.clone())
@@ -182,4 +239,7 @@ struct Opt {
     /// AFL_DUMP_MAP_SIZE + x where x = map bias
     #[arg(short = 'm')]
     map_bias: usize,
+    #[arg(short = 'F')]
+    foreign_sync_dirs: Vec<PathBuf>,
 }
+pub const SHM_CMPLOG_ENV_VAR: &str = "__AFL_CMPLOG_SHM_ID";
