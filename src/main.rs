@@ -10,22 +10,22 @@ use libafl::{
     inputs::{BytesInput, GeneralizedInputMetadata},
     monitors::MultiMonitor,
     mutators::{
-        havoc_mutations, GrimoireExtensionMutator, GrimoireRandomDeleteMutator,
+        havoc_mutations, tokens_mutations, GrimoireExtensionMutator, GrimoireRandomDeleteMutator,
         GrimoireRecursiveReplacementMutator, GrimoireStringReplacementMutator,
-        HavocScheduledMutator,
+        HavocScheduledMutator, Tokens,
     },
     observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
     schedulers::{powersched::PowerSchedule, StdWeightedScheduler},
     stages::{GeneralizationStage, StdMutationalStage},
     state::StdState,
-    Fuzzer, StdFuzzer,
+    Fuzzer, HasMetadata, StdFuzzer,
 };
 use libafl_bolts::{
     core_affinity::Cores,
     current_nanos,
     rands::StdRand,
     shmem::{ShMem, ShMemProvider, StdShMemProvider, UnixShMemProvider},
-    tuples::tuple_list,
+    tuples::{tuple_list, Merge},
     AsSliceMut, TargetArgs,
 };
 const SHMEM_ENV_VAR: &str = "__AFL_SHM_ID";
@@ -80,6 +80,11 @@ fn main() {
             )
             .unwrap()
         });
+        if let Some(dict) = opt.dict_path {
+            let mut tokens = Tokens::new();
+            tokens = tokens.add_from_files(vec![dict]).expect("tokens");
+            state.add_metadata(tokens);
+        }
         let scheduler = StdWeightedScheduler::with_schedule(
             &mut state,
             &edges_observer,
@@ -90,7 +95,9 @@ fn main() {
 
         let generalization = GeneralizationStage::new(&edges_observer);
         // Setup a mutational stage with a basic bytes mutator
-        let mutator = HavocScheduledMutator::with_max_stack_pow(havoc_mutations(), 5);
+        let mutator = HavocScheduledMutator::with_max_stack_pow(
+            havoc_mutations().merge(tokens_mutations()), 3
+        );
         let grimoire_mutator = HavocScheduledMutator::with_max_stack_pow(
             tuple_list!(
                 GrimoireExtensionMutator::new(),
@@ -157,4 +164,7 @@ struct Opt {
     /// Timeout in seconds
     #[arg(short = 't', default_value_t = 1)]
     hang_timeout: u64,
+    /// tokens
+    #[arg(short = 'x')]
+    dict_path: Option<PathBuf>,
 }
