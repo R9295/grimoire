@@ -1,6 +1,6 @@
-use std::{io::ErrorKind, path::PathBuf, time::Duration};
+use std::{io::ErrorKind, path::PathBuf, process::Command, time::Duration};
 
-use clap::Parser;
+use clap::{Parser};
 use libafl::{
     corpus::{CachedOnDiskCorpus, OnDiskCorpus},
     events::{ClientDescription, EventConfig, Launcher},
@@ -51,9 +51,19 @@ fn main() {
                       mut mgr: _,
                       core: ClientDescription|
      -> Result<(), libafl_bolts::Error> {
+        let map_size = {
+            let map_size = Command::new(opt.executable.clone())
+                .env("AFL_DUMP_MAP_SIZE", "1")
+                .output()
+                .expect("target gave no output");
+            let map_size = String::from_utf8(map_size.stdout)
+                .expect("target returned illegal mapsize")
+                .replace("\n", "");
+            map_size.parse::<usize>().expect("illegal mapsize output") + opt.map_bias
+        };
         // Create the shared memory map for comms with the forkserver
         let mut shmem_provider = UnixShMemProvider::new().unwrap();
-        let mut shmem = shmem_provider.new_shmem(65536).unwrap();
+        let mut shmem = shmem_provider.new_shmem(map_size).unwrap();
         unsafe {
             shmem.write_to_env(SHMEM_ENV_VAR).unwrap();
         }
@@ -96,7 +106,8 @@ fn main() {
         let generalization = GeneralizationStage::new(&edges_observer);
         // Setup a mutational stage with a basic bytes mutator
         let mutator = HavocScheduledMutator::with_max_stack_pow(
-            havoc_mutations().merge(tokens_mutations()), 3
+            havoc_mutations().merge(tokens_mutations()),
+            3,
         );
         let grimoire_mutator = HavocScheduledMutator::with_max_stack_pow(
             tuple_list!(
@@ -116,7 +127,7 @@ fn main() {
         );
         let mut executor = ForkserverExecutor::builder()
             .program(opt.executable.clone())
-            .coverage_map_size(65536)
+            .coverage_map_size(map_size)
             .debug_child(true)
             .is_persistent(true)
             .is_deferred_frksrv(true)
@@ -168,4 +179,7 @@ struct Opt {
     /// tokens
     #[arg(short = 'x')]
     dict_path: Option<PathBuf>,
+    /// AFL_DUMP_MAP_SIZE + x where x = map bias
+    #[arg(short = 'm')]
+    map_bias: usize,
 }
